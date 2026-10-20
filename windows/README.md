@@ -1,12 +1,13 @@
 # whisper-at-cursor-position — Windows
 
 Press **F2**, speak, press **F2** again. The transcript is typed wherever your cursor is.
-Runs Whisper on your GPU through [whisper.cpp](https://github.com/ggml-org/whisper.cpp) + Vulkan, so AMD, Nvidia and Intel cards all work.
+Runs Whisper on your GPU through [whisper.cpp](https://github.com/ggml-org/whisper.cpp) + Vulkan, so AMD, Nvidia and Intel cards all work. No compiler or GPU? Use [Groq's hosted Whisper](#no-compiler-use-groq) instead: `install.ps1 -Groq`.
 
 ## How it works
 
 - `whisper_tray.py` — tray app. Starts `whisper-server.exe` with the model pre-loaded in VRAM, listens for the hotkey, records the microphone and types the result via `SendInput`.
 - `server.py` — starts/stops `whisper-server.exe` (localhost only). It's tied to a Job Object, so it never outlives the tray app, even if the app crashes.
+- `groq_backend.py` — the cloud alternative: uploads the recording to Groq's Whisper API and returns the text. Used when `GROQ_API_KEY` is set.
 - `overlay.py` — the floating pill at the bottom of the screen: **● Recording 0:04**, **Transcribing…**. It's click-through and never takes focus.
 - `typer.py` — types Unicode text directly (accents, ¿, ñ, emoji) regardless of keyboard layout.
 
@@ -31,6 +32,21 @@ cd windows
 `install.ps1` options: `-Model large-v3-turbo` (or `medium`, `small`, …) and `-NoStartup`.
 
 No GPU? Instead of building, unzip `whisper-bin-x64.zip` from the [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases) into `windows\bin\`. The app itself doesn't change.
+
+## No compiler? Use Groq
+
+Transcribe in the cloud instead of building whisper.cpp. Nothing to compile, no 3 GB model.
+
+1. Get an API key at https://console.groq.com/keys (the free tier is plenty for dictation).
+2. From `windows\`, run `.\install.ps1 -Groq`. It creates the venv, asks for the key once and adds the Startup shortcut.
+
+The key is stored as the user environment variable `GROQ_API_KEY`, and `WHISPER_BACKEND` is set to `groq`. F2, Esc and the overlay work exactly the same.
+
+What changes:
+- **Privacy**: each recording is sent over TLS to Groq and transcribed there. Nothing is kept locally, except that a failed transcription leaves the audio at `%LOCALAPPDATA%\whisper-at-cursor\last-failed.wav` so the dictation isn't lost.
+- **Length**: the free tier accepts up to 25 MB per request, about 12 minutes of dictation. The app stops recording by itself at that point and transcribes what it has.
+- **Quota**: every request counts as at least 10 seconds of audio against the Groq limits.
+- Set `GROQ_WHISPER_MODEL=whisper-large-v3` for the more accurate (slower) model.
 
 ## Usage
 
@@ -58,10 +74,13 @@ Set these as user environment variables (System → Advanced → Environment Var
 
 | Variable | Default | |
 |----------|---------|-|
-| `WHISPER_MODEL` | `large-v3` | Must match a `models\ggml-<name>.bin` file |
-| `WHISPER_LANG` | `auto` | `auto`, or force one: `es`, `en`, … |
+| `WHISPER_BACKEND` | `auto` | `auto` = Groq if `GROQ_API_KEY` is set, else local. `local` / `groq` force one |
+| `WHISPER_MODEL` | `large-v3` | Local only. Must match a `models\ggml-<name>.bin` file |
+| `WHISPER_LANG` | `auto` | `auto`, or force one: `es`, `en`, … (Groq needs the 2-letter ISO-639-1 code) |
 | `WHISPER_HOTKEY` | `f2` | Any [keyboard](https://github.com/boppreh/keyboard#api) hotkey, e.g. `ctrl+shift+space` |
-| `WHISPER_PORT` | `8178` | Local port for whisper-server |
+| `WHISPER_PORT` | `8178` | Local only. Port for whisper-server |
+| `GROQ_API_KEY` | – | Groq only. Set by `install.ps1 -Groq` |
+| `GROQ_WHISPER_MODEL` | `whisper-large-v3-turbo` | Groq only. Or `whisper-large-v3` (more accurate, slower) |
 
 ## Limitations
 

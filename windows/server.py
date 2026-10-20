@@ -25,6 +25,12 @@ CREATE_NO_WINDOW = 0x08000000
 _NON_SPEECH = re.compile(r"^\s*[\[(][^\])]*[\])]\s*$")
 
 
+def clean_transcript(text: str) -> str:
+    """Drop non-speech markers ("[BLANK_AUDIO]", "(music)") and join the lines."""
+    lines = [ln.strip() for ln in text.splitlines()]
+    return " ".join(ln for ln in lines if ln and not _NON_SPEECH.match(ln))
+
+
 # ── Job Object (kill child when parent exits) ─────────────────────────────────
 
 class _IO_COUNTERS(ctypes.Structure):
@@ -86,6 +92,9 @@ def _kill_on_close_job(proc: subprocess.Popen):
 # ── Server ─────────────────────────────────────────────────────────────────────
 
 class WhisperServer:
+    name = "local"
+    max_seconds = None      # no recording cap: the audio never leaves the machine
+
     def __init__(self, exe: str, model: str, language: str, port: int):
         self.exe = exe
         self.model = model
@@ -162,8 +171,7 @@ class WhisperServer:
         if "error" in result:
             raise RuntimeError(result["error"])
 
-        lines = [ln.strip() for ln in result.get("text", "").splitlines()]
-        return " ".join(ln for ln in lines if ln and not _NON_SPEECH.match(ln))
+        return clean_transcript(result.get("text", ""))
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Whisper Voice Input — Windows tray app
-- Starts whisper-server.exe (whisper.cpp, Vulkan) with the model pre-loaded
+- Transcribes locally with whisper-server.exe (whisper.cpp, Vulkan) or in the cloud via Groq
 - F2 toggles recording, Esc cancels while recording
 - Transcribes and types the result at the current cursor position
 - Floating overlay pill shows recording / transcribing state
@@ -38,6 +38,7 @@ from typer import type_text
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 BASE_DIR      = Path(__file__).resolve().parent
+WHISPER_BACKEND = os.environ.get("WHISPER_BACKEND", "auto").strip().lower()   # auto / local / groq
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")   # tiny / base / small / medium / large-v3 / large-v3-turbo
 WHISPER_LANG  = os.environ.get("WHISPER_LANG", "auto")        # auto / en / es / ...
 HOTKEY        = os.environ.get("WHISPER_HOTKEY", "f2")
@@ -112,10 +113,40 @@ def make_icon(color: str) -> Image.Image:
     return img.resize((64, 64), Image.LANCZOS)
 
 
+# ── Backend ────────────────────────────────────────────────────────────────────
+
+def make_backend():
+    """WHISPER_BACKEND=auto|local|groq. auto → Groq if GROQ_API_KEY is set, else local."""
+    choice = WHISPER_BACKEND
+    if choice == "auto":
+        choice = "groq" if os.environ.get("GROQ_API_KEY", "").strip() else "local"
+        log.info("WHISPER_BACKEND=auto → %s", choice)
+    if choice == "local":
+        for path, what in ((SERVER_EXE, "whisper-server.exe"), (MODEL_FILE, "Model file")):
+            if not path.exists():
+                message_box(f"{what} not found:\n{path}\n\n"
+                            "Run install.ps1 first, or install.ps1 -Groq to transcribe in the cloud.")
+                sys.exit(1)
+        return WhisperServer(str(SERVER_EXE), str(MODEL_FILE), WHISPER_LANG, PORT)
+    if choice == "groq":
+        from groq_backend import GroqBackend, GROQ_MODEL, resolve_groq_key   # lazy: the local path never imports openai
+        key = resolve_groq_key()
+        if not key:
+            message_box("GROQ_API_KEY is not set.\n\n"
+                        "Run install.ps1 -Groq (get a key at https://console.groq.com/keys),\n"
+                        "or set WHISPER_BACKEND=local to use whisper-server.exe.")
+            sys.exit(1)
+        return GroqBackend(WHISPER_LANG, GROQ_MODEL, key)
+    message_box(f"WHISPER_BACKEND must be auto, local or groq (got {WHISPER_BACKEND!r}).")
+    sys.exit(1)
+
+
 # ── App ────────────────────────────────────────────────────────────────────────
 
 class App:
-    def __init__(self):
+    def __init__(self, backend):
+        self.backend = backend
+        self.title = f"{APP_NAME} ({backend.name})"
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.withdraw()
@@ -127,13 +158,13 @@ class App:
         self.frames = []
         self.esc_hotkey = None
         self.last_toggle = 0.0
+        self._limit_job = None
 
-        self.server = WhisperServer(str(SERVER_EXE), str(MODEL_FILE), WHISPER_LANG, PORT)
         self.icons = {k: make_icon(c) for k, c in ICON_COLORS.items()}
         self.tray = pystray.Icon(
             "whisper-at-cursor",
             icon=self.icons["loading"],
-            title=f"{APP_NAME} — {STATUS_TEXT['loading']}",
+            title=f"{self.title} — {STATUS_TEXT['loading']}",
             menu=pystray.Menu(
                 pystray.MenuItem(lambda _: STATUS_TEXT[self.state], None, enabled=False),
                 pystray.MenuItem("Open log", lambda: os.startfile(LOG_FILE)),
@@ -155,21 +186,22 @@ class App:
     def _start_server(self) -> None:
         try:
             t0 = time.monotonic()
-            self.server.start()
-            self.server.wait_ready()
-            # The first inference compiles GPU shaders; do it now rather than on the first dictation
-            self.server.transcribe(to_wav(np.zeros((SAMPLE_RATE, 1), np.int16)))
-            log.info("Model '%s' ready in %.1fs.", WHISPER_MODEL, time.monotonic() - t0)
+            self.backend.start()
+            self.backend.wait_ready()
+            if isinstance(self.backend, WhisperServer):
+                # The first inference compiles GPU shaders; do it now rather than on the first dictation
+                self.backend.transcribe(to_wav(np.zeros((SAMPLE_RATE, 1), np.int16)))
+            log.info("Backend %s ready in %.1fs.", self.backend.name, time.monotonic() - t0)
             self.events.put(("ready",))
         except Exception as exc:
-            log.exception("Server failed to start")
-            self.events.put(("fatal", f"whisper-server failed to start:\n{exc}\n\nSee {LOG_FILE}"))
+            log.exception("Backend failed to start")
+            self.events.put(("fatal", f"{self.backend.name} backend failed to start:\n{exc}\n\nSee {LOG_FILE}"))
 
     def _quit(self) -> None:
         log.info("Quitting.")
         self._close_stream()
         keyboard.unhook_all()
-        self.server.stop()
+        self.backend.stop()
         self.tray.stop()
         self.root.destroy()
 
@@ -188,12 +220,12 @@ class App:
     def _set_state(self, state: str) -> None:
         self.state = state
         self.tray.icon = self.icons[state]
-        self.tray.title = f"{APP_NAME} — {STATUS_TEXT[state]}"
+        self.tray.title = f"{self.title} — {STATUS_TEXT[state]}"
         self.tray.update_menu()
 
     def _on_ready(self) -> None:
         self._set_state("idle")
-        self.overlay.show("info", "Whisper ready", hide_after_ms=1500)
+        self.overlay.show("info", f"Whisper ready ({self.backend.name})", hide_after_ms=1500)
 
     def _on_fatal(self, msg: str) -> None:
         self.overlay.hide()
@@ -225,6 +257,17 @@ class App:
         self._set_state("idle")
         self.overlay.show("info", "Cancelled", hide_after_ms=1000)
 
+    def _on_limit(self) -> None:
+        """root.after callback (Tk thread): the recording cap of the backend was reached."""
+        self._limit_job = None
+        if self.state != "recording":
+            return
+        log.info("Recording reached the %ds cap of the %s backend; stopping.",
+                 self.backend.max_seconds, self.backend.name)
+        self._stop_recording()
+        if self.state == "transcribing":
+            self.overlay.show("transcribing", "Max length reached — transcribing…")
+
     def _on_done(self, text: str) -> None:
         self._set_state("idle")
         if text:
@@ -252,11 +295,17 @@ class App:
             self.overlay.show("error", f"Microphone error: {exc}", hide_after_ms=4000)
             return
         self.esc_hotkey = keyboard.add_hotkey("esc", lambda: self.events.put(("cancel",)), suppress=True)
+        if self.backend.max_seconds:
+            # Cloud uploads are capped; stop by ourselves at the limit so nothing is lost
+            self._limit_job = self.root.after(int(self.backend.max_seconds * 1000), self._on_limit)
         self._set_state("recording")
         self.overlay.show("recording")
         log.info("Recording started.")
 
     def _close_stream(self) -> None:
+        if self._limit_job is not None:
+            self.root.after_cancel(self._limit_job)
+            self._limit_job = None
         if self.esc_hotkey is not None:
             keyboard.remove_hotkey(self.esc_hotkey)
             self.esc_hotkey = None
@@ -280,9 +329,10 @@ class App:
         threading.Thread(target=self._transcribe_and_type, args=(audio,), daemon=True).start()
 
     def _transcribe_and_type(self, audio: np.ndarray) -> None:
+        wav = to_wav(audio)
         try:
             t0 = time.monotonic()
-            text = self.server.transcribe(to_wav(audio))
+            text = self.backend.transcribe(wav)
             log.info("Transcribed in %.2fs: %r", time.monotonic() - t0, text)
 
             if text:
@@ -292,6 +342,12 @@ class App:
             self.events.put(("done", text))
         except Exception as exc:
             log.exception("Transcription error")
+            # Keep the audio so a transient failure (network, rate limit) does not lose the dictation
+            try:
+                (LOG_DIR / "last-failed.wav").write_bytes(wav)
+                log.info("Audio kept at %s", LOG_DIR / "last-failed.wav")
+            except OSError:
+                pass
             self.events.put(("error", f"Error: {exc}"))
 
 
@@ -301,12 +357,9 @@ def main():
     if not single_instance():
         log.info("Another instance is already running; exiting.")
         return
-    for path, what in ((SERVER_EXE, "whisper-server.exe"), (MODEL_FILE, "Model file")):
-        if not path.exists():
-            message_box(f"{what} not found:\n{path}\n\nRun install.ps1 first.")
-            sys.exit(1)
-    log.info("Starting %s (model=%s, lang=%s, hotkey=%s)", APP_NAME, WHISPER_MODEL, WHISPER_LANG, HOTKEY)
-    App().run()
+    backend = make_backend()        # shows a message box and exits when nothing is set up
+    log.info("Starting %s (backend=%s, lang=%s, hotkey=%s)", APP_NAME, backend.name, WHISPER_LANG, HOTKEY)
+    App(backend).run()
 
 
 if __name__ == "__main__":

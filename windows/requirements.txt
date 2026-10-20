@@ -1,5 +1,6 @@
 keyboard
 numpy
+openai>=3
 Pillow
 pystray
 sounddevice
