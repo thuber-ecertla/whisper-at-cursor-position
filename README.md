@@ -2,7 +2,7 @@
 
 A lightweight voice-input daemon that pre-loads OpenAI Whisper and types transcribed speech at your cursor position. Triggered by a keyboard shortcut. Works with AMD and Nvidia graphics cards.
 
-> **Windows?** See [`windows/`](windows/README.md): a tray app with an F2 hotkey and a recording overlay, running on the GPU via whisper.cpp + Vulkan.
+> **Windows?** See [`windows/`](windows/README.md): a tray app with an F2 hotkey and a recording overlay, running on the GPU via whisper.cpp + Vulkan, or in the cloud via Groq when there is no compiler or GPU.
 
 ## How it works
 
